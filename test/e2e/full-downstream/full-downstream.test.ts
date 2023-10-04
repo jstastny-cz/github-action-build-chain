@@ -550,3 +550,236 @@ test("PR from target:branchA to target:branchB while using mapping of a non-star
     output: "exist",
   });
 });
+
+
+test("reproducer", async () => {
+  const moctokit = new Moctokit("http://api.github.com");
+  const act = new Act();
+  const repoPath = mockGithub.repo.getPath("build-chain");
+  const parentDir = path.dirname(repoPath!);
+  const result = await act
+    .setGithubToken("token")
+    .setEnv("GITHUB_SERVER_URL", `${parentDir}${path.sep}`)
+    .setEnv("GITHUB_REPOSITORY", "owner1/project1")
+    .setEnv(
+      "CLONE_DIR",
+      `${path.join(parentDir, "owner1_project1", "project1")} ${path.join(
+        parentDir,
+        "owner1_project2",
+        "project2"
+      )} ${path.join(parentDir, "owner1_project3", "project3")}`
+    )
+    .setEvent({
+      pull_request: {
+        head: {
+          ref: "branchA",
+          repo: {
+            full_name: "owner2/project1-fork",
+            name: "project1",
+            owner: {
+              login: "owner2",
+            },
+          },
+        },
+        base: {
+          ref: "branchB",
+          repo: {
+            full_name: "owner1/project1",
+            name: "project1",
+            owner: {
+              login: "owner1",
+            },
+          },
+        },
+      },
+    })
+    .runEvent("pull_request", {
+      ...logActOutput("full-downstream-1.log"),
+      cwd: parentDir,
+      workflowFile: repoPath,
+      bind: true,
+      mockApi: [
+        moctokit.rest.repos
+          .get({
+            owner: "owner1",
+            repo: /project(1|2|3|4)/,
+          })
+          .setResponse({
+            status: 404,
+            data: {},
+            repeat: 4
+          }),
+        moctokit.rest.repos
+          .listForks({
+            owner: "owner1",
+            repo: "project1",
+          })
+          .setResponse({
+            status: 200,
+            data: [
+              {
+                name: "project1-fork",
+                owner: {
+                  login: "owner2",
+                },
+              },
+            ],
+          }),
+        moctokit.rest.repos
+          .listForks({
+            owner: "owner1",
+            repo: "project3",
+          })
+          .setResponse({
+            status: 200,
+            data: [{ name: "project3", owner: { login: "owner2" } }],
+          }),
+        moctokit.rest.repos
+          .listForks({
+            owner: "owner1",
+            repo: /project(2|4)/,
+          })
+          .setResponse({
+            status: 200,
+            data: [],
+            repeat: 2
+          }),
+        moctokit.rest.pulls
+          .list({
+            owner: "owner1",
+            repo: /project(1|2|3|4)/,
+          })
+          .setResponse({ status: 200, data: [{ title: "pr" }], repeat: 4 }),
+      ],
+    });
+
+  expect(result.length).toBe(4);
+  expect(result[0]).toStrictEqual({
+    name: "Main actions/checkout@v2",
+    status: 0,
+    output: "",
+  });
+  expect(result[1]).toMatchObject({ name: "Main ./build-chain", status: 0 });
+  expect(result[1].groups?.length).toBe(18);
+  
+  // pre section
+  const group1 = result[1].groups![0];
+  expect(group1.name).toBe("Executing pre section");
+  expect(group1.output).toEqual(
+    expect.stringContaining("Executing pre step 1")
+  );
+  expect(group1.output).toEqual(
+    expect.stringContaining("Executing pre step 2")
+  );
+
+  // execution plan
+  const group2 = result[1].groups![1];
+  expect(group2.name).toBe("Execution Plan");
+  expect(group2.output).toEqual(
+    expect.stringContaining("4 projects will be executed")
+  );
+  expect(group2.output).toEqual(expect.stringContaining("[owner1/project1]"));
+  expect(group2.output).toEqual(
+    expect.stringContaining("Level type: current")
+  );
+  expect(group2.output).toEqual(expect.stringContaining("[owner1/project3]"));
+  expect(group2.output).toEqual(
+    expect.stringContaining("Level type: downstream")
+  );
+  expect(group2.output).toEqual(expect.stringContaining("[owner1/project2]"));
+  expect(group2.output).toEqual(
+    expect.stringContaining("Level type: downstream")
+  );
+  expect(group2.output).toEqual(expect.stringContaining("[owner1/project4]"));
+  expect(group2.output).toEqual(expect.stringContaining("Level type: downstream"));
+
+  // checkout projects. important to verify the mapped targets
+  const group4 = result[1].groups![3];
+  expect(group4.name).toBe("Checkout summary");
+  expect(group4.output).toEqual(expect.stringContaining("[owner1/project1]"));
+  expect(group4.output).toEqual(
+    expect.stringContaining("Project taken from owner1/project1:branchB")
+  );
+  expect(group4.output).toEqual(
+    expect.stringContaining("Merged owner2/project1-fork:branchA into branch branchB")
+  );
+  expect(group4.output).toEqual(expect.stringContaining("[owner1/project2]"));
+  expect(group4.output).toEqual(
+    expect.stringContaining("Project taken from owner1/project2:8.x")
+  );
+  expect(group4.output).toEqual(
+    expect.stringContaining(
+      "Merged owner1/project2:branchA into branch 8.x"
+    )
+  );
+  expect(group4.output).toEqual(expect.stringContaining("[owner1/project3]"));
+  expect(group4.output).toEqual(
+    expect.stringContaining("Project taken from owner1/project3:8.x")
+  );
+  expect(group4.output).toEqual(
+    expect.stringContaining(
+      "Merged owner2/project3:branchA into branch 8.x"
+    )
+  );
+  expect(group4.output).toEqual(expect.stringContaining("[owner1/project4]"));
+  expect(group4.output).toEqual(
+    expect.stringContaining("Project taken from owner1/project4:8.x")
+  );
+  expect(group4.output).toEqual(
+    expect.stringContaining(
+      "Merged owner1/project4:branchA into branch 8.x"
+    )
+  );
+
+  // owner1/project1 section
+  const group5 = result[1].groups![4];
+  expect(group5.name).toBe("Executing owner1/project1");
+  expect(group5.output).toEqual(
+    expect.stringContaining("before current owner1/project1")
+  );
+  expect(group5.output).toEqual(
+    expect.stringContaining("current owner1/project1")
+  );
+  expect(group5.output).toEqual(
+    expect.stringContaining("default after current")
+  );
+
+  // owner1/project2 section
+  const group9 = result[1].groups![8];
+  expect(group9.name).toBe("Executing owner1/project2");
+  expect(group9.output).toEqual(
+    expect.stringContaining("current owner1/project2")
+  );
+  expect(group9.output).toEqual(expect.stringContaining("after downstream owner1/project2"));
+
+  // owner1/project3 section
+  const group12 = result[1].groups![11];
+  expect(group12.name).toBe("Executing owner1/project3");
+  expect(group12.output).toEqual(
+    expect.stringContaining("default after current")
+  );
+
+  // owner1/project4 section
+  const group15 = result[1].groups![14];
+  expect(group15.name).toBe("Executing owner1/project4");
+  expect(group15.output).toEqual(
+    expect.stringContaining("default current")
+  );
+  expect(group15.output).toEqual(
+    expect.stringContaining("default after current")
+  );
+  
+  // artifacts
+  const group18 = result[1].groups![17];
+  expect(group18.name).toBe("Uploading artifacts");
+  expect(group18.output).toEqual(
+    expect.stringContaining("No artifacts to archive")
+  );
+  
+  // clone check is done during the workflow execution. just verify it succeeded here
+  expect(result[2]).toStrictEqual({
+    name: "Main Check for clones",
+    status: 0,
+    output: "exist",
+  });
+});
